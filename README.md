@@ -195,16 +195,18 @@ Every team member sees their commitments on a personal dashboard. Team Leads get
 │              │   AI Engine   │                                   │
 │              └───────────────┘                                  │
 │                                                                 │
-│  Utils: sendEmail (Nodemailer) │ notificationHelper (Socket.io) │
-│  Real-time: Socket.io Server (Rooms: user, meeting, team)       │
-└───────────────────────────┬─────────────────────────────────────┘
+│  Utils: sendEmail (Nodemailer) │ notificationHelper (Socket.io)       │
+│  Cache: Redis (users, teams, meetings, tasks, notifications)          │
+│  Real-time: Socket.io + Redis adapter (multi-instance)                │
+└───────────────────────────┬───────────────────────────────────────────┘
                             │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     DATABASE (MongoDB Atlas)                    │
-│                                                                 │
-│  Collections: Users │ Teams │ Meetings │ Notifications │ Contact│
-└─────────────────────────────────────────────────────────────────┘
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+┌─────────────────────────┐  ┌─────────────────────────┐
+│  MongoDB Atlas          │  │  Redis                  │
+│  Users Teams Meetings   │  │  Cache + pub/sub + RL   │
+│  Notifications Contact  │  │                         │
+└─────────────────────────┘  └─────────────────────────┘
 ```
 
 ---
@@ -360,6 +362,7 @@ meetloop/
 | **Node.js + Express** | REST API server |
 | **MongoDB + Mongoose** | NoSQL database & ODM |
 | **Socket.io** | Real-time bi-directional communication |
+| **Redis** | Response cache, rate limits, Socket.io pub/sub |
 | **Google Generative AI** | Gemini AI for task extraction |
 | **JWT (jsonwebtoken)** | Stateless authentication |
 | **bcryptjs** | Password hashing |
@@ -375,6 +378,7 @@ meetloop/
 - **MongoDB** (Atlas cloud or local instance)
 - **Google Gemini API Key** ([Get one here](https://aistudio.google.com/app/apikey))
 - **SMTP Email Credentials** (for password reset & team invites)
+- **Redis** (recommended for production: caching, rate limits, multi-instance Socket.io)
 
 ### 1. Clone the Repository
 
@@ -412,7 +416,14 @@ FROM_EMAIL=your_email@gmail.com
 
 # Client URL (for password reset links & invite links)
 CLIENT_URL=http://localhost:5173
+
+# Redis (optional; use your hosted Redis TCP URL, such as an Upstash rediss:// URL)
+REDIS_URL=rediss://your-redis-connection-url
+REDIS_PREFIX=meetloop
+# REDIS_ENABLED=false
 ```
+
+For hosted Redis providers such as Upstash, set `REDIS_URL` to the provider's TCP connection URL (usually `rediss://...`), not its REST URL or token.
 
 Start the server:
 
@@ -421,6 +432,8 @@ npm start
 ```
 
 The server will start on `http://localhost:5000`.
+
+When Redis is configured, confirm `GET http://localhost:5000/health` reports `"redis": "connected"`.
 
 ### 3. Setup the Client
 

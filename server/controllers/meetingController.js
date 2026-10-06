@@ -2,6 +2,22 @@ import Meeting from '../models/Meeting.js';
 import Team from '../models/Team.js';
 import { sendNotification } from '../utils/notificationHelper.js';
 import { io } from '../index.js';
+import {
+    cacheGetOrSet,
+    invalidateMeeting,
+    invalidateTeam,
+    keys,
+    TTL,
+    toPlain
+} from '../utils/cache.js';
+
+const bustMeetingCaches = async (meeting) => {
+    await invalidateMeeting(meeting);
+    const teamId = meeting.team?._id || meeting.team;
+    if (!teamId) return;
+    const team = await Team.findById(teamId).select('_id members inviteCode');
+    if (team) await invalidateTeam(team);
+};
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import dotenv from 'dotenv';
@@ -25,8 +41,8 @@ const extractWithAI = async (notes, teamMembers, currentUserName = null, current
         // List of models to try in order of preference
         // We include both explicit names and aliases like 'latest'
         const modelsToTry = [
+            'gemini-3.8-flash',
             'gemini-2.0-flash',
-            'gemini-1.5-flash',
             'gemini-flash-latest',
             'gemini-pro-latest',
             'gemini-1.5-pro'
@@ -247,6 +263,9 @@ export const createMeeting = async (req, res) => {
 
         await meeting.save();
 
+        await invalidateTeam(team);
+        await invalidateMeeting(meeting);
+
         // ── Real-time Notifications for Tasks ──────────────────────────
         if (meeting.tasks && meeting.tasks.length > 0) {
             meeting.tasks.forEach(task => {
@@ -280,17 +299,25 @@ export const createMeeting = async (req, res) => {
 // ── @access  Private ───────────────────────────────────────────────────
 export const getMyMeetings = async (req, res) => {
     try {
-        const teams = await Team.find({
-            'members.user': req.user._id
-        }).select('_id');
+        const meetings = await cacheGetOrSet(
+            keys.meetingsByUser(req.user._id),
+            TTL.MEETINGS_LIST,
+            async () => {
+                const teams = await Team.find({
+                    'members.user': req.user._id
+                }).select('_id');
 
-        const teamIds = teams.map(t => t._id);
+                const teamIds = teams.map(t => t._id);
 
-        const meetings = await Meeting.find({ team: { $in: teamIds } })
-            .populate('team', 'name logo')
-            .populate('createdBy', 'name email profilePic')
-            .populate('tasks.assignedTo', 'name email profilePic')
-            .sort({ date: -1 });
+                const docs = await Meeting.find({ team: { $in: teamIds } })
+                    .populate('team', 'name logo')
+                    .populate('createdBy', 'name email profilePic')
+                    .populate('tasks.assignedTo', 'name email profilePic')
+                    .sort({ date: -1 });
+
+                return toPlain(docs);
+            }
+        );
 
         res.json(meetings);
     } catch (error) {
@@ -303,17 +330,30 @@ export const getMyMeetings = async (req, res) => {
 // ── @access  Private ───────────────────────────────────────────────────
 export const getMeetingById = async (req, res) => {
     try {
-        const meeting = await Meeting.findById(req.params.id)
-            .populate('team', 'name logo members')
-            .populate('createdBy', 'name email profilePic')
-            .populate('tasks.assignedTo', 'name email profilePic');
+        const meeting = await cacheGetOrSet(
+            keys.meeting(req.params.id),
+            TTL.MEETING,
+            async () => {
+                const doc = await Meeting.findById(req.params.id)
+                    .populate('team', 'name logo members')
+                    .populate('createdBy', 'name email profilePic')
+                    .populate('tasks.assignedTo', 'name email profilePic');
+                return doc ? toPlain(doc) : null;
+            }
+        );
 
         if (!meeting) {
             return res.status(404).json({ message: 'Meeting not found' });
         }
 
-        const team = await Team.findById(meeting.team._id || meeting.team);
-        const isMember = team.members.some(m => m.user && m.user.toString() === req.user._id.toString());
+        const teamId = meeting.team?._id || meeting.team;
+        const team = meeting.team?.members
+            ? meeting.team
+            : await Team.findById(teamId);
+        const isMember = team?.members?.some(m => {
+            const uid = m.user?._id || m.user;
+            return uid && uid.toString() === req.user._id.toString();
+        });
         if (!isMember) {
             return res.status(403).json({ message: 'Access denied' });
         }
@@ -366,6 +406,8 @@ export const updateMeeting = async (req, res) => {
             io.to(`team_${meeting.team._id || meeting.team}`).emit('meeting_list_update');
         }
 
+        await bustMeetingCaches(populated);
+
         res.json(populated);
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -387,6 +429,9 @@ export const deleteMeeting = async (req, res) => {
         }
 
         await meeting.deleteOne();
+        await invalidateMeeting(meeting);
+        const team = await Team.findById(meeting.team).select('_id members inviteCode');
+        if (team) await invalidateTeam(team);
         res.json({ message: 'Meeting deleted' });
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -570,6 +615,8 @@ export const reExtractTasks = async (req, res) => {
             io.to(`team_${meeting.team._id || meeting.team}`).emit('meeting_list_update');
         }
 
+        await bustMeetingCaches(populated);
+
         res.json(populated);
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -631,6 +678,8 @@ export const updateTaskStatus = async (req, res) => {
             io.to(`team_${meeting.team._id || meeting.team}`).emit('meeting_list_update');
         }
 
+        await bustMeetingCaches(populated);
+
         res.json(populated);
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -642,42 +691,50 @@ export const updateTaskStatus = async (req, res) => {
 // ── @access  Private ───────────────────────────────────────────────────
 export const getMyTasks = async (req, res) => {
     try {
-        const teams = await Team.find({
-            'members.user': req.user._id
-        }).select('_id');
+        const myTasks = await cacheGetOrSet(
+            keys.tasksByUser(req.user._id),
+            TTL.TASKS,
+            async () => {
+                const teams = await Team.find({
+                    'members.user': req.user._id
+                }).select('_id');
 
-        const teamIds = teams.map(t => t._id);
+                const teamIds = teams.map(t => t._id);
 
-        const meetings = await Meeting.find({
-            team: { $in: teamIds },
-            'tasks.assignedTo': req.user._id
-        })
-            .populate('team', 'name logo')
-            .populate('createdBy', 'name email profilePic')
-            .populate('tasks.assignedTo', 'name email profilePic')
-            .sort({ date: -1 });
+                const meetings = await Meeting.find({
+                    team: { $in: teamIds },
+                    'tasks.assignedTo': req.user._id
+                })
+                    .populate('team', 'name logo')
+                    .populate('createdBy', 'name email profilePic')
+                    .populate('tasks.assignedTo', 'name email profilePic')
+                    .sort({ date: -1 });
 
-        const myTasks = [];
-        meetings.forEach(meeting => {
-            meeting.tasks.forEach(task => {
-                if (task.assignedTo && task.assignedTo._id.toString() === req.user._id.toString()) {
-                    myTasks.push({
-                        _id: task._id,
-                        description: task.description,
-                        assignedTo: task.assignedTo,
-                        dueDate: task.dueDate,
-                        priority: task.priority,
-                        status: task.status,
-                        meeting: {
-                            _id: meeting._id,
-                            title: meeting.title,
-                            date: meeting.date,
-                            team: meeting.team
+                const tasks = [];
+                meetings.forEach(meeting => {
+                    meeting.tasks.forEach(task => {
+                        if (task.assignedTo && task.assignedTo._id.toString() === req.user._id.toString()) {
+                            tasks.push({
+                                _id: task._id,
+                                description: task.description,
+                                assignedTo: task.assignedTo,
+                                dueDate: task.dueDate,
+                                priority: task.priority,
+                                status: task.status,
+                                meeting: {
+                                    _id: meeting._id,
+                                    title: meeting.title,
+                                    date: meeting.date,
+                                    team: meeting.team
+                                }
+                            });
                         }
                     });
-                }
-            });
-        });
+                });
+
+                return toPlain(tasks);
+            }
+        );
 
         res.json(myTasks);
     } catch (error) {

@@ -1,7 +1,9 @@
 import User from '../models/User.js';
+import Team from '../models/Team.js';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import sendEmail from '../utils/sendEmail.js';
+import { cacheGetOrSet, invalidateTeam, invalidateUser, keys, TTL, toPlain } from '../utils/cache.js';
 
 const generateToken = (id) => {
     return jwt.sign({ id }, process.env.JWT_SECRET, {
@@ -71,17 +73,26 @@ export const login = async (req, res) => {
 // @desc    Get user profile
 export const getProfile = async (req, res) => {
     try {
-        const user = await User.findById(req.user._id);
+        const profile = await cacheGetOrSet(
+            keys.user(req.user._id),
+            TTL.USER,
+            async () => {
+                const user = await User.findById(req.user._id);
+                if (!user) return null;
+                return toPlain({
+                    _id: user._id,
+                    name: user.name,
+                    email: user.email,
+                    role: user.role,
+                    profilePic: user.profilePic,
+                    jobRole: user.jobRole,
+                    preferences: user.preferences
+                });
+            }
+        );
 
-        if (user) {
-            res.json({
-                _id: user._id,
-                name: user.name,
-                email: user.email,
-                role: user.role,
-                profilePic: user.profilePic,
-                jobRole: user.jobRole
-            });
+        if (profile) {
+            res.json(profile);
         } else {
             res.status(404).json({ message: 'User not found' });
         }
@@ -111,6 +122,10 @@ export const updateProfile = async (req, res) => {
 
             const updatedUser = await user.save();
 
+            await invalidateUser(updatedUser._id);
+            const teams = await Team.find({ 'members.user': updatedUser._id }).select('_id members inviteCode');
+            await Promise.all(teams.map((team) => invalidateTeam(team)));
+
             res.json({
                 _id: updatedUser._id,
                 name: updatedUser.name,
@@ -138,9 +153,10 @@ export const deleteAccount = async (req, res) => {
             return res.status(404).json({ message: 'User not found' });
         }
 
-        // 1. Delete all meetings where this user is the lead/owner
-        // (Assuming we have a Meeting model, let's just do account deletion for now)
+        const teams = await Team.find({ 'members.user': user._id }).select('_id members inviteCode');
         await User.findByIdAndDelete(req.user._id);
+        await invalidateUser(user._id);
+        await Promise.all(teams.map((team) => invalidateTeam(team, [user._id])));
 
         res.json({ message: 'Account and all associated data purged successfully' });
     } catch (error) {

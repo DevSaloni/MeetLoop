@@ -1,6 +1,4 @@
-import dotenv from 'dotenv';
-// Load environment variables immediately
-dotenv.config();
+import 'dotenv/config';
 
 import express from 'express';
 import mongoose from 'mongoose';
@@ -13,6 +11,8 @@ import notificationRoutes from './routes/notificationRoutes.js';
 import miscRoutes from './routes/miscRoutes.js';
 import http from 'http';
 import { Server } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-adapter';
+import { connectRedis, getRedisPubSub, isRedisReady } from './config/redis.js';
 
 const app = express();
 const server = http.createServer(app);
@@ -40,6 +40,18 @@ app.use('/api/misc', miscRoutes);
 // Basic Route
 app.get('/', (req, res) => {
   res.send('MeetLoop API is running...');
+});
+
+app.get('/health', (req, res) => {
+  const mongoOk = mongoose.connection.readyState === 1;
+  const redisOk = isRedisReady();
+  const ok = mongoOk;
+  res.status(ok ? 200 : 503).json({
+    status: ok ? 'ok' : 'degraded',
+    mongo: mongoOk ? 'connected' : 'disconnected',
+    redis: redisOk ? 'connected' : 'unavailable',
+    uptime: Math.round(process.uptime())
+  });
 });
 
 // Socket.io connection logic
@@ -71,14 +83,27 @@ io.on('connection', (socket) => {
 // Export io for controllers
 export { io };
 
-// Database Connection
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => {
+const start = async () => {
+  try {
+    await mongoose.connect(process.env.MONGODB_URI);
     console.log('Connected to MongoDB');
+
+    const { ready: redisReady } = await connectRedis();
+    if (redisReady) {
+      const { pub, sub } = getRedisPubSub();
+      io.adapter(createAdapter(pub, sub));
+      console.log('[Socket.io] Redis adapter enabled (multi-instance safe)');
+    } else {
+      console.warn('[Socket.io] running without Redis adapter — realtime is single-instance only');
+    }
+
     server.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
     });
-  })
-  .catch((err) => {
-    console.error('MongoDB connection error:', err);
-  });
+  } catch (err) {
+    console.error('Startup error:', err);
+    process.exit(1);
+  }
+};
+
+start();

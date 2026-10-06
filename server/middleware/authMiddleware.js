@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
+import { cacheGet, cacheSet, keys, TTL, toPlain } from '../utils/cache.js';
 
 export const protect = async (req, res, next) => {
     let token;
@@ -12,8 +13,15 @@ export const protect = async (req, res, next) => {
             // Verify token
             const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-            // Get user from token (exclude password)
-            req.user = await User.findById(decoded.id).select('-password');
+            const cachedUser = await cacheGet(keys.user(decoded.id));
+            if (cachedUser) {
+                req.user = cachedUser;
+            } else {
+                req.user = await User.findById(decoded.id).select('-password');
+                if (req.user) {
+                    await cacheSet(keys.user(decoded.id), toPlain(req.user), TTL.USER);
+                }
+            }
 
             if (!req.user) {
                 return res.status(401).json({ message: 'Not authorized, user not found' });

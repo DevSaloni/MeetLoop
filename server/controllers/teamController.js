@@ -1,8 +1,17 @@
 import Team from '../models/Team.js';
-import User from '../models/User.js';
 import sendEmail from '../utils/sendEmail.js';
 import { sendNotification } from '../utils/notificationHelper.js';
 import { io } from '../index.js';
+import {
+    cacheGet,
+    cacheGetOrSet,
+    cacheSet,
+    invalidateTeam,
+    invalidateUser,
+    keys,
+    TTL,
+    toPlain
+} from '../utils/cache.js';
 
 // @desc    Create a new team
 // @route   POST /api/teams
@@ -44,6 +53,9 @@ export const createTeam = async (req, res) => {
             .populate('creator', 'name email profilePic')
             .populate('members.user', 'name email profilePic role jobRole');
 
+        await invalidateTeam(populatedTeam);
+        await invalidateUser(req.user._id);
+
         res.status(201).json({
             success: true,
             data: populatedTeam
@@ -68,7 +80,16 @@ export const joinTeam = async (req, res) => {
             return res.status(400).json({ message: 'Please provide an invite code' });
         }
 
-        const team = await Team.findOne({ inviteCode: inviteCode.toUpperCase() });
+        const normalizedCode = inviteCode.toUpperCase();
+        const cachedInvite = await cacheGet(keys.invite(normalizedCode));
+        let team = cachedInvite?._id ? await Team.findById(cachedInvite._id) : null;
+
+        if (!team) {
+            team = await Team.findOne({ inviteCode: normalizedCode });
+            if (team) {
+                await cacheSet(keys.invite(normalizedCode), { _id: team._id }, TTL.INVITE);
+            }
+        }
 
         if (!team) {
             return res.status(404).json({ message: 'Invalid invite code. No team found.' });
@@ -119,6 +140,9 @@ export const joinTeam = async (req, res) => {
             .populate('creator', 'name email profilePic')
             .populate('members.user', 'name email profilePic role jobRole');
 
+        await invalidateTeam(populatedTeam, [req.user._id]);
+        await invalidateUser(req.user._id);
+
         res.status(200).json({
             success: true,
             message: `Successfully joined "${team.name}"`,
@@ -135,18 +159,23 @@ export const joinTeam = async (req, res) => {
 // @access  Private
 export const getMyTeams = async (req, res) => {
     try {
-        const teams = await Team.find({
-            'members.user': req.user._id
-        })
-            .populate('creator', 'name email profilePic')
-            .populate('members.user', 'name email profilePic role jobRole')
-            .sort({ createdAt: -1 });
+        const payload = await cacheGetOrSet(
+            keys.teamsByUser(req.user._id),
+            TTL.TEAMS_LIST,
+            async () => {
+                const teams = await Team.find({
+                    'members.user': req.user._id
+                })
+                    .populate('creator', 'name email profilePic')
+                    .populate('members.user', 'name email profilePic role jobRole')
+                    .sort({ createdAt: -1 });
 
-        res.status(200).json({
-            success: true,
-            count: teams.length,
-            data: teams
-        });
+                const data = toPlain(teams);
+                return { success: true, count: data.length, data };
+            }
+        );
+
+        res.status(200).json(payload);
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: error.message });
@@ -158,17 +187,23 @@ export const getMyTeams = async (req, res) => {
 // @access  Private (must be a member)
 export const getTeamById = async (req, res) => {
     try {
-        const team = await Team.findById(req.params.id)
-            .populate('creator', 'name email profilePic')
-            .populate('members.user', 'name email profilePic role jobRole');
+        const team = await cacheGetOrSet(
+            keys.team(req.params.id),
+            TTL.TEAM,
+            async () => {
+                const doc = await Team.findById(req.params.id)
+                    .populate('creator', 'name email profilePic')
+                    .populate('members.user', 'name email profilePic role jobRole');
+                return doc ? toPlain(doc) : null;
+            }
+        );
 
         if (!team) {
             return res.status(404).json({ message: 'Team not found' });
         }
 
-        // Check if user is a member
         const isMember = team.members.some(
-            m => m.user._id.toString() === req.user._id.toString()
+            m => (m.user?._id || m.user)?.toString() === req.user._id.toString()
         );
 
         if (!isMember) {
@@ -211,6 +246,8 @@ export const updateTeam = async (req, res) => {
         const updatedTeam = await Team.findById(team._id)
             .populate('creator', 'name email profilePic')
             .populate('members.user', 'name email profilePic role jobRole');
+
+        await invalidateTeam(updatedTeam);
 
         res.status(200).json({
             success: true,
@@ -261,6 +298,9 @@ export const removeMember = async (req, res) => {
             .populate('creator', 'name email profilePic')
             .populate('members.user', 'name email profilePic role jobRole');
 
+        await invalidateTeam(updatedTeam, [req.params.userId]);
+        await invalidateUser(req.params.userId);
+
         res.status(200).json({
             success: true,
             message: 'Member removed successfully',
@@ -296,6 +336,9 @@ export const leaveTeam = async (req, res) => {
 
         await team.save();
 
+        await invalidateTeam(team, [req.user._id]);
+        await invalidateUser(req.user._id);
+
         if (io) {
             io.to(`team_${team._id}`).emit('team_update', {
                 teamId: team._id,
@@ -330,8 +373,12 @@ export const regenerateInviteCode = async (req, res) => {
         }
 
         const crypto = await import('crypto');
+        const previousCode = team.inviteCode;
         team.inviteCode = crypto.randomBytes(4).toString('hex').toUpperCase();
         await team.save();
+
+        await invalidateTeam({ ...team.toObject(), inviteCode: previousCode });
+        await invalidateTeam(team);
 
         res.status(200).json({
             success: true,
@@ -359,6 +406,7 @@ export const deleteTeam = async (req, res) => {
         }
 
         await Team.findByIdAndDelete(req.params.id);
+        await invalidateTeam(team);
 
         res.status(200).json({
             success: true,

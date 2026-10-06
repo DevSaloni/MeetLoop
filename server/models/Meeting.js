@@ -100,6 +100,10 @@ const meetingSchema = new mongoose.Schema({
     timestamps: true
 });
 
+meetingSchema.index({ team: 1, date: -1 });
+meetingSchema.index({ 'tasks.assignedTo': 1 });
+meetingSchema.index({ createdBy: 1 });
+
 // Virtual: task stats
 meetingSchema.virtual('taskStats').get(function () {
     const total = this.tasks.length;

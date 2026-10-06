@@ -53,6 +53,9 @@ const teamSchema = new mongoose.Schema({
     timestamps: true
 });
 
+teamSchema.index({ 'members.user': 1 });
+teamSchema.index({ creator: 1 });
+
 // Generate a unique 8-char invite code before saving
 teamSchema.pre('save', function (next) {
     if (!this.inviteCode) {
